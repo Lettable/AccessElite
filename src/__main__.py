@@ -8,7 +8,7 @@ from src.modules import ALL_MODULES
 
 async def main():
     for all_module in ALL_MODULES:
-        importlib.import_module(f"promo.modules.{all_module}")
+        importlib.import_module(f"src.modules.{all_module}")
     
     LOGGER.info(f"Successfully loaded {len(ALL_MODULES)} Modules.")
     LOGGER.info("Bot Started G!")
