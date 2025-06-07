@@ -1,0 +1,5 @@
+from os import getenv
+API_ID = int(getenv("API_ID", 24384291))
+API_HASH = str(getenv("API_HASH", "5d65c2a9002707f3200c4d596b682036"))
+BOT_TOKEN = str(getenv("BOT_TOKEN", ""))
+SUDOERS = list(map(int, getenv("SUDOERS", "6586350542").split()))
