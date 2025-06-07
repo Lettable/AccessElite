@@ -4,8 +4,8 @@ import time
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, ChannelInvalid, FloodWait
 from pyrogram.types import BotCommand
-from config import API_ID, API_HASH, BOT_TOKEN
 import config
+from src.database.db import db
 
 logging.basicConfig(
     format="[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s",
@@ -18,15 +18,22 @@ LOGGER = logging.getLogger(__name__)
 
 app = Client(
     "App",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN,
 )
 
 boot = time.time()
 async def initialize():
     try:
         await app.start()
+        await db.init(
+            host=config.DB_HOST,
+            port=config.DB_PORT,
+            user=config.DB_USER,
+            password=config.DB_PASS,
+            db_name=config.DB_NAME
+        )
         await asyncio.sleep(1)
     except FloodWait as ex:
         LOGGER.warning(ex)
