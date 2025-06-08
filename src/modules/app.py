@@ -12,6 +12,8 @@ import re
 import json
 from datetime import datetime
 from src.database.db import db
+from src.utils.invoice import invoice
+import config
 
 dmps = {}
 
@@ -30,6 +32,7 @@ REQUIRED_RIGHTS = {
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        # Existing group start handler remains the same
         if not await is_group_admin(client, message.chat.id, message.from_user.id):
             await message.reply("Only group admins can configure the bot.")
             return
@@ -75,13 +78,277 @@ async def start(client: Client, message: Message):
             await message.reply(f"Error checking bot status: {str(e)}")
     
     else:
-        await message.reply(
-            f"Welcome to {app.me.first_name}.\nChoose an option below.",
+        start_params = message.text.split()
+        if len(start_params) > 1 and start_params[1].startswith('-100'):
+            group_id = start_params[1]
+            
+            chat_data = await db.fetch_one(
+                "SELECT chat_id, owner_id, mem_pricing, ads_pricing, ltc_address, title FROM chats WHERE chat_id = %s",
+                (group_id,))
+            
+            if not chat_data:
+                await message.reply("This group is not configured with the bot yet.")
+                return
+            
+            try:
+                chat = await client.get_chat(int(group_id))
+                chat_title = chat.title
+                owner = await client.get_users(chat_data['owner_id'])
+                owner_username = f"@{owner.username}" if owner.username else f"user #{owner.id}"
+            except Exception as e:
+                chat_title = chat_data.get('title', 'Unknown Group')
+                owner_username = f"user #{chat_data['owner_id']}"
+            
+            keyboard = []
+            if chat_data['mem_pricing']:
+                keyboard.append([InlineKeyboardButton("Member", callback_data=f"plans_mem_{group_id}")])
+            if chat_data['ads_pricing']:
+                keyboard.append([InlineKeyboardButton("Ads Perm", callback_data=f"plans_ads_{group_id}")])
+            
+            if not keyboard:
+                await message.reply("This group hasn't set up any pricing plans yet.")
+                return
+            
+            await message.reply(
+                f"**Group:** {chat_title}\n"
+                f"**Owner:** {owner_username}\n\n"
+                "Choose what you want to purchase:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.reply(
+                f"Welcome to {app.me.first_name}.\nChoose an option below.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Add me to Group", url=f"https://t.me/{app.me.username}?startgroup=start&admin=change_info+delete_messages+restrict_members+invite_users+pin_messages+manage_topics+promote_members+manage_video_chats+manage_chat")],
+                    [InlineKeyboardButton("Help", callback_data="show_help"), InlineKeyboardButton("Terms", callback_data="show_terms")]
+                ])
+            )
+
+@app.on_callback_query(filters.regex(r"^plans_(mem|ads)_(-?\d+)$"))
+async def show_plans(client: Client, callback_query: CallbackQuery):
+    plan_type = callback_query.matches[0].group(1)
+    group_id = callback_query.matches[0].group(2)
+    user_id = callback_query.from_user.id
+    
+    chat_data = await db.fetch_one(
+        f"SELECT {plan_type}_pricing, ltc_address FROM chats WHERE chat_id = %s",
+        (group_id,))
+    
+    if not chat_data or not chat_data[f"{plan_type}_pricing"]:
+        await callback_query.answer("Owner hasn't set pricing for this yet.", show_alert=True)
+        return
+    
+    try:
+        pricing_data = json.loads(chat_data[f"{plan_type}_pricing"])
+    except json.JSONDecodeError:
+        await callback_query.answer("Invalid pricing data format.", show_alert=True)
+        return
+    
+    keyboard = []
+    row = []
+    for i, plan in enumerate(pricing_data):
+        row.append(InlineKeyboardButton(
+            f"{plan['period']}: {plan['price']}$",
+            callback_data=f"confirm_{plan_type}_{group_id}_{i}"
+        ))
+        if len(row) == 2 or i == len(pricing_data) - 1:
+            keyboard.append(row)
+            row = []
+    
+    keyboard.append([InlineKeyboardButton("« Back", callback_data=f"back_to_main_{group_id}")])
+    
+    await callback_query.edit_message_text(
+        f"Available {plan_type} plans:\n\n"
+        "Select a plan to continue:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^confirm_(mem|ads)_(-?\d+)_(\d+)$"))
+async def confirm_plan(client: Client, callback_query: CallbackQuery):
+    plan_type = callback_query.matches[0].group(1)
+    group_id = callback_query.matches[0].group(2)
+    plan_index = int(callback_query.matches[0].group(3))
+    user_id = callback_query.from_user.id
+    
+    chat_data = await db.fetch_one(
+        f"SELECT {plan_type}_pricing, ltc_address FROM chats WHERE chat_id = %s",
+        (group_id,))
+    
+    if not chat_data or not chat_data[f"{plan_type}_pricing"]:
+        await callback_query.answer("Owner hasn't set pricing for this yet.", show_alert=True)
+        return
+    
+    try:
+        pricing_data = json.loads(chat_data[f"{plan_type}_pricing"])
+        selected_plan = pricing_data[plan_index]
+    except (json.JSONDecodeError, IndexError):
+        await callback_query.answer("Invalid pricing data.", show_alert=True)
+        return
+    
+    expiration_date = calculate_expiration(selected_plan['period'])
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirm", callback_data=f"create_invoice_{plan_type}_{group_id}_{plan_index}")],
+        [InlineKeyboardButton("« Back to Plans", callback_data=f"plans_{plan_type}_{group_id}")]
+    ]
+    
+    await callback_query.edit_message_text(
+        f"**Plan Details:**\n\n"
+        f"• Type: {plan_type}\n"
+        f"• Period: {selected_plan['period']}\n"
+        f"• Price: {selected_plan['price']}$\n"
+        f"• Ads Perm: {'Yes' if plan_type == 'ads' else 'No'}\n\n"
+        f"If you join today, your access will expire on:\n"
+        f"{expiration_date.strftime('%Y-%m-%d %H:%M:%S')}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^create_invoice_(mem|ads)_(-?\d+)_(\d+)$"))
+async def create_invoice(client: Client, callback_query: CallbackQuery):
+    plan_type = callback_query.matches[0].group(1)
+    group_id = callback_query.matches[0].group(2)
+    plan_index = int(callback_query.matches[0].group(3))
+    user_id = callback_query.from_user.id
+    
+    # Query database for pricing data
+    chat_data = await db.fetch_one(
+        f"SELECT {plan_type}_pricing, ltc_address FROM chats WHERE chat_id = %s",
+        (group_id,))
+    
+    if not chat_data or not chat_data[f"{plan_type}_pricing"]:
+        await callback_query.answer("Owner hasn't set pricing for this yet.", show_alert=True)
+        return
+    
+    try:
+        pricing_data = json.loads(chat_data[f"{plan_type}_pricing"])
+        selected_plan = pricing_data[plan_index]
+    except (json.JSONDecodeError, IndexError):
+        await callback_query.answer("Invalid pricing data.", show_alert=True)
+        return
+    
+    data = {
+        "ltc_address": chat_data['ltc_address'],
+        "plans": {
+            "amount": selected_plan['price']
+        }
+    }
+    
+    try:
+        result = invoice(config.FF_API_KEY, config.FF_API_SECRET, data)
+        
+        if result.get('code') != 0:
+            raise Exception(result.get('msg', 'Unknown error'))
+        
+        await db.exec(
+            """
+            INSERT INTO invoices 
+                (user_id, chat_id, token, amount, deposit_address, status, created_at)
+            VALUES 
+                (%s, %s, %s, %s, %s, 'pending', NOW())
+            """,
+            (
+                user_id,
+                group_id,
+                result['data']['token'],
+                selected_plan['price'],
+                result['data']['from']['address']
+            )
+        )
+        
+        invoice_id = await db.fetch_val(
+            "SELECT LAST_INSERT_ID()"
+        )
+        
+        await callback_query.edit_message_text(
+            f"**Invoice Created**\n\n"
+            f"• Invoice ID: `{invoice_id}`\n"
+            f"• Price: {selected_plan['price']}$\n"
+            f"• Payment Address: `{result['data']['from']['address']}`\n"
+            f"• Exact Amount to Send: {result['data']['from']['amount']} {result['data']['from']['code']}\n\n"
+            f"Please send the exact amount to the address above.\n"
+            f"Your access will be granted after confirmation.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Add me to Group", url=f"https://t.me/{app.me.username}?startgroup=start&admin=change_info+delete_messages+restrict_members+invite_users+pin_messages+manage_topics+promote_members+manage_video_chats+manage_chat")],
-                [InlineKeyboardButton("Help", callback_data="show_help"), InlineKeyboardButton("Terms", callback_data="show_terms")]
+                [InlineKeyboardButton("« Back to Group", callback_data=f"back_to_main_{group_id}")]
+            ]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+    except Exception as e:
+        print(f"Error creating invoice: {str(e)}")
+        
+        await callback_query.edit_message_text(
+            f"Failed to create invoice: {str(e)}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("« Back", callback_data=f"confirm_{plan_type}_{group_id}_{plan_index}")]
             ])
         )
+    
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^back_to_main_(-?\d+)$"))
+async def back_to_main(client: Client, callback_query: CallbackQuery):
+    group_id = callback_query.matches[0].group(1)
+    
+    chat_data = await db.fetch_one(
+        "SELECT chat_id, owner_id, mem_pricing, ads_pricing, ltc_address, title FROM chats WHERE chat_id = %s",
+        (group_id,))
+    
+    if not chat_data:
+        await callback_query.answer("Group data not found.", show_alert=True)
+        return
+    
+    try:
+        chat = await client.get_chat(int(group_id))
+        chat_title = chat.title
+        owner = await client.get_users(chat_data['owner_id'])
+        owner_username = f"@{owner.username}" if owner.username else f"user #{owner.id}"
+    except Exception as e:
+        chat_title = chat_data.get('title', 'Unknown Group')
+        owner_username = f"user #{chat_data['owner_id']}"
+    
+    keyboard = []
+    if chat_data['mem_pricing']:
+        keyboard.append([InlineKeyboardButton("Member", callback_data=f"plans_mem_{group_id}")])
+    if chat_data['ads_pricing']:
+        keyboard.append([InlineKeyboardButton("Ads Perm", callback_data=f"plans_ads_{group_id}")])
+    
+    await callback_query.edit_message_text(
+        f"**Group:** {chat_title}\n"
+        f"**Owner:** {owner_username}\n\n"
+        "Choose what you want to purchase:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await callback_query.answer()
+
+def calculate_expiration(period_str):
+    from datetime import datetime, timedelta
+    
+    now = datetime.now()
+    parts = period_str.split()
+    
+    if len(parts) != 2:
+        return now + timedelta(days=30)
+    
+    try:
+        num = int(parts[0])
+        unit = parts[1].lower()
+        
+        if 'day' in unit:
+            return now + timedelta(days=num)
+        elif 'week' in unit:
+            return now + timedelta(weeks=num)
+        elif 'month' in unit:
+            return now + timedelta(days=num*30)
+        elif 'year' in unit:
+            return now + timedelta(days=num*365)
+        else:
+            return now + timedelta(days=30)
+    except:
+        return now + timedelta(days=30)
 
 async def is_group_owner(client: Client, chat_id: int, user_id: int):
     try:
@@ -282,9 +549,9 @@ async def config_ltc_callback(client: Client, callback_query: CallbackQuery):
         "💰 **Set Litecoin Address** 💰\n\n"
         "Please send your Litecoin (LTC) address where you want to receive payments.\n\n"
         "Example: `LbFz5YdzhF4YkMPe6ZJ9mRzY6vE8XgJX7q`\n\n"
-        "⚠️ Make sure this address is correct as all payments will be sent here.",
+        "⚠️ Make sure this address is correct as all payments will be sent here. Click back after sending!",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Cancel", callback_data=f"back_to_main_config:{chat_id}")]
+            [InlineKeyboardButton("↩️ Back", callback_data=f"back_to_main_config:{chat_id}")]
         ]),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -482,7 +749,7 @@ async def pricing_action_callback(client: Client, callback_query: CallbackQuery)
     await callback_query.message.edit(
         text,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Back", callback_data=f"pricing_{pricing_type}_back:{chat_id}")]
+            [InlineKeyboardButton("↩️ Back", callback_data=f"back_to_main_config:{chat_id}")]
         ]),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -654,7 +921,7 @@ async def save_chat_config(chat_id, owner_id, mem_pricing, ads_pricing, refundab
     
     await db.exec(
         """
-        INSERT INTO group_settings (chat_id, owner_id, mem_pricing, ads_pricing, refundable, ltc_address, updated_at)
+        INSERT INTO chats (chat_id, owner_id, mem_pricing, ads_pricing, refundable, ltc_address, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, NOW())
         ON DUPLICATE KEY UPDATE
             mem_pricing = VALUES(mem_pricing),
